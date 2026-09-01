@@ -8,6 +8,10 @@ from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from django_filters.rest_framework import DjangoFilterBackend
 
+
+from django.db.models import Count, Avg, Q, F, DurationField, ExpressionWrapper
+from .models import Asset, Employee, CheckOut
+
 from .models import Asset, Employee, CheckOut
 from .serializers import (
     AssetSerializer, EmployeeSerializer, CheckOutSerializer,
@@ -98,4 +102,72 @@ def return_asset(request, pk):
         asset.status = Asset.Status.MAINTENANCE if data['needs_maintenance'] else Asset.Status.AVAILABLE
         asset.save(update_fields=['status', 'updated_at'])
 
-    return success_response(CheckOutSerializer(checkout).data, status=200)  
+    return success_response(CheckOutSerializer(checkout).data, status=200)
+
+
+
+@api_view(['GET'])
+def employee_summary(request, employee_code):
+    employee = get_object_or_404(Employee, employee_code=employee_code)
+    now = timezone.now()
+
+    duration_expr = ExpressionWrapper(
+        F('checkouts__returned_at') - F('checkouts__checked_out_at'),
+        output_field=DurationField(),
+    )
+
+    stats = Employee.objects.filter(pk=employee.pk).aggregate(
+        lifetime_checkout_count=Count('checkouts'),
+        currently_held_count=Count(
+            'checkouts', filter=Q(checkouts__returned_at__isnull=True)
+        ),
+        currently_overdue_count=Count(
+            'checkouts',
+            filter=Q(checkouts__returned_at__isnull=True, checkouts__due_at__lt=now),
+        ),
+        mean_hold_duration=Avg(
+            duration_expr, filter=Q(checkouts__returned_at__isnull=False)
+        ),
+    )
+
+    mean_days = None
+    if stats['mean_hold_duration'] is not None:
+        mean_days = round(stats['mean_hold_duration'].total_seconds() / 86400, 2)
+
+    return Response({
+        'employee_code': employee.employee_code,
+        'full_name': employee.full_name,
+        'lifetime_checkout_count': stats['lifetime_checkout_count'],
+        'currently_held_count': stats['currently_held_count'],
+        'currently_overdue_count': stats['currently_overdue_count'],
+        'mean_hold_duration_days': mean_days,
+    })
+
+
+@api_view(['GET'])
+def overdue_report(request):
+    now = timezone.now()
+    days_overdue_expr = ExpressionWrapper(
+        now - F('due_at'), output_field=DurationField()
+    )
+
+    checkouts = (
+        CheckOut.objects
+        .filter(returned_at__isnull=True, due_at__lt=now)
+        .select_related('asset', 'employee')
+        .annotate(days_overdue_duration=days_overdue_expr)
+        .order_by('-days_overdue_duration')
+    )
+
+    rows = [
+        {
+            'asset_name': c.asset.name,
+            'asset_tag': c.asset.asset_tag,
+            'employee_code': c.employee.employee_code,
+            'employee_name': c.employee.full_name,
+            'days_overdue': c.days_overdue_duration.days,
+        }
+        for c in checkouts
+    ]
+
+    return Response({'count': len(rows), 'results': rows})

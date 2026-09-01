@@ -6,4 +6,7 @@ urlpatterns = [
     path('assets/<int:pk>/', views.AssetDetailView.as_view(), name='asset-detail'),
     path('checkouts/', views.check_out_asset, name='checkout-create'),
     path('checkouts/<int:pk>/return/', views.return_asset, name='checkout-return'),
+    path('employees/<str:employee_code>/summary/', views.employee_summary, name='employee-summary'),
+    path('reports/overdue/', views.overdue_report, name='overdue-report'),
+    
 ]
