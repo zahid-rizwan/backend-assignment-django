@@ -13,7 +13,8 @@ from .serializers import (
     AssetSerializer, EmployeeSerializer, CheckOutSerializer,
     CheckOutCreateSerializer, ReturnSerializer,
 )
-from core.api_utils import success_response, error_response   # ← ADD THIS IMPORT
+
+from core.api_utils import success_response, error_response
 
 
 class AssetListCreateView(generics.ListCreateAPIView):
@@ -43,37 +44,38 @@ def check_out_asset(request):
     employee = get_object_or_404(Employee, employee_code=data['employee_code'])
 
     if not employee.is_active:
-        return error_response("employee is not active", code="EMPLOYEE_INACTIVE", status=400)   # ← CHANGE
+        return error_response("employee is not active", code="EMPLOYEE_INACTIVE", status=400)  
 
     now = timezone.now()
     if data['due_at'] <= now or data['due_at'] > now + timedelta(days=30):
-        return error_response(                                                                   # ← CHANGE
+        return error_response(                                                                
             "due_at must be in the future and within 30 days",
             code="INVALID_DUE_DATE", status=400,
         )
 
     open_count = CheckOut.objects.filter(employee=employee, returned_at__isnull=True).count()
     if open_count >= 3:
-        return error_response("employee already has 3 open checkouts", code="CHECKOUT_LIMIT_REACHED", status=409)  # ← CHANGE
+        return error_response("employee already has 3 open checkouts", code="CHECKOUT_LIMIT_REACHED", status=409) 
 
     try:
         with transaction.atomic():
             asset = Asset.objects.select_for_update().get(asset_tag=data['asset_tag'])
 
-            if asset.status != 'AVAILABLE':
-                return error_response("asset is not available", code="ASSET_NOT_AVAILABLE", status=409)  # ← CHANGE
+
+            if asset.status != Asset.Status.AVAILABLE:
+                return error_response("asset is not available", code="ASSET_NOT_AVAILABLE", status=409)  
 
             checkout = CheckOut.objects.create(
                 asset=asset,
                 employee=employee,
                 due_at=data['due_at'],
             )
-            asset.status = 'CHECKED_OUT'
+            asset.status = Asset.Status.CHECKED_OUT
             asset.save(update_fields=['status', 'updated_at'])
     except Asset.DoesNotExist:
-        return error_response("asset not found", code="ASSET_NOT_FOUND", status=404)   # ← CHANGE
+        return error_response("asset not found", code="ASSET_NOT_FOUND", status=404)  
 
-    return success_response(CheckOutSerializer(checkout).data, status=201)   # ← CHANGE
+    return success_response(CheckOutSerializer(checkout).data, status=201) 
 
 
 @api_view(['POST'])
@@ -85,7 +87,7 @@ def return_asset(request, pk):
     checkout = get_object_or_404(CheckOut, pk=pk)
 
     if checkout.returned_at is not None:
-        return error_response("already returned", code="ALREADY_RETURNED", status=409)   # ← CHANGE
+        return error_response("already returned", code="ALREADY_RETURNED", status=409)   
 
     with transaction.atomic():
         checkout.returned_at = timezone.now()
@@ -93,7 +95,7 @@ def return_asset(request, pk):
         checkout.save(update_fields=['returned_at', 'condition_note'])
 
         asset = checkout.asset
-        asset.status = 'MAINTENANCE' if data['needs_maintenance'] else 'AVAILABLE'
+        asset.status = Asset.Status.MAINTENANCE if data['needs_maintenance'] else Asset.Status.AVAILABLE
         asset.save(update_fields=['status', 'updated_at'])
 
-    return success_response(CheckOutSerializer(checkout).data, status=200)   # ← CHANGE
+    return success_response(CheckOutSerializer(checkout).data, status=200)  

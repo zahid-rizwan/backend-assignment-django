@@ -2,22 +2,20 @@ from django.db import models
 
 # Create your models here.
 class Asset(models.Model):
-    CATEGORY_CHOICES = [
-        ('CAMERA', 'Camera'),
-        ('LAPTOP', 'Laptop'),
-        ('SENSOR', 'Sensor'),
-        ('VEHICLE', 'Vehicle'),
-    ]
-    STATUS_CHOICES = [
-        ('AVAILABLE', 'Available'),
-        ('CHECKED_OUT', 'Checked Out'),
-        ('MAINTENANCE', 'Maintenance'),
-    ]
+    class Category(models.TextChoices):
+        CAMERA = 'CAMERA', 'Camera'
+        LAPTOP = 'LAPTOP', 'Laptop'
+        SENSOR = 'SENSOR', 'Sensor'
+        VEHICLE = 'VEHICLE', 'Vehicle'
 
+    class Status(models.TextChoices):
+        AVAILABLE = 'AVAILABLE', 'Available'
+        CHECKED_OUT = 'CHECKED_OUT', 'Checked Out'
+        MAINTENANCE = 'MAINTENANCE', 'Maintenance'
     asset_tag = models.CharField(max_length=32, unique=True, db_index=True)
     name = models.CharField(max_length=120)
-    category = models.CharField(max_length=20, choices=CATEGORY_CHOICES)
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='AVAILABLE')
+    category = models.CharField(max_length=20, choices=Category.choices)
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.AVAILABLE)
     purchase_date = models.DateField()
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
