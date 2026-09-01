@@ -1,10 +1,11 @@
 from datetime import timedelta
 
-from django.db import transaction, IntegrityError
+from django.db import transaction, connection
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import status, generics, filters
-from rest_framework.decorators import api_view
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from django_filters.rest_framework import DjangoFilterBackend
 
@@ -43,14 +44,18 @@ def check_out_asset(request):
     serializer = CheckOutCreateSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
     data = serializer.validated_data
-    employee = get_object_or_404(Employee, employee_code=data['employee_code'])
+
+    try:
+        employee = Employee.objects.get(employee_code=data['employee_code'])
+    except Employee.DoesNotExist:
+        return error_response("employee not found", code="EMPLOYEE_NOT_FOUND", status=404)
 
     if not employee.is_active:
         return error_response("employee is not active", code="EMPLOYEE_INACTIVE", status=400)
 
     now = timezone.now()
     if data['due_at'] <= now or data['due_at'] > now + timedelta(days=30):
-        return error_response(                                                                
+        return error_response(
             "due_at must be in the future and within 30 days",
             code="INVALID_DUE_DATE", status=400,
         )
@@ -78,6 +83,24 @@ def check_out_asset(request):
     except Asset.DoesNotExist:
         return error_response("asset not found", code="ASSET_NOT_FOUND", status=404)
 
+    return success_response(CheckOutSerializer(checkout).data, status=201)
+
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def health_check(request):
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute('SELECT 1')
+    except Exception:
+        return error_response('database unavailable', code='HEALTHCHECK_FAILED', status=503)
+
+    return success_response({
+        'status': 'ok',
+        'database': 'ok',
+        'service': 'artikate-checkout',
+    })
+
 
 @api_view(['POST'])
 def return_asset(request, pk):
@@ -88,7 +111,7 @@ def return_asset(request, pk):
     checkout = get_object_or_404(CheckOut, pk=pk)
 
     if checkout.returned_at is not None:
-        return error_response("already returned", code="ALREADY_RETURNED", status=409)   
+        return error_response("already returned", code="ALREADY_RETURNED", status=409)
 
     with transaction.atomic():
         checkout.returned_at = timezone.now()
