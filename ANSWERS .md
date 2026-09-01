@@ -162,3 +162,75 @@ def send_overdue_notices():
 **What would've caught this before it shipped**
 
 The most direct test is just running the task twice in a row against the same data and checking that no duplicate notices or duplicate emails happen — that targets the idempotency issue head-on regardless of scale. A lint rule or review habit around "never pass a model instance into `.delay()`" would catch the serialization risk. And for the scale problem specifically, there's really no substitute for testing against a seeded dataset that's actually large — tens of thousands of rows, not ten — before trusting this in production.
+
+---
+
+## Part C — Optimise a slow PostgreSQL query
+
+**The query as given:**
+
+```sql
+SELECT * FROM checkouts c
+WHERE DATE(c.checked_out_at) BETWEEN '2026-01-01' AND '2026-06-30'
+  AND c.returned_at IS NULL
+  AND c.employee_id IN (SELECT id FROM employees WHERE is_active = true)
+ORDER BY c.due_at ASC;
+```
+
+`checkouts` has about 4.2 million rows and grows by roughly 8,000 a day. `employees` has about 12,000 rows. The only indexes that exist are the primary keys and the default foreign-key indexes Django creates on `asset_id` and `employee_id`.
+
+### 1. Rewrite the query
+
+```sql
+SELECT id, asset_id, employee_id, checked_out_at, due_at, returned_at
+FROM checkouts c
+JOIN employees e ON e.id = c.employee_id AND e.is_active = true
+WHERE c.checked_out_at >= '2026-01-01T00:00:00Z'
+  AND c.checked_out_at <  '2026-07-01T00:00:00Z'
+  AND c.returned_at IS NULL
+ORDER BY c.due_at ASC;
+```
+
+`DATE(c.checked_out_at) BETWEEN ...` wraps the column in a function, which makes the condition non-sargable — Postgres can't use an index on `checked_out_at` even if one existed, because it would have to compute `DATE(...)` for every row before comparing. Switching to a plain half-open range on `checked_out_at` fixes that. I also changed the upper bound from `<= '2026-06-30'` to `< '2026-07-01'` on purpose — `BETWEEN` against a `timestamptz` column with a date-only literal only covers midnight of June 30th, so the original query silently drops every checkout from later that same day. The rewrite is both faster and more correct.
+
+`SELECT *` became an explicit column list, dropping `condition_note` — a reporting screen almost certainly doesn't need a free-text field, and skipping it cuts I/O per row.
+
+The `IN (SELECT ...)` became an explicit `JOIN`. Honestly, I don't expect a big performance difference here — Postgres 15 usually flattens an `IN` subquery like this into a semi-join on its own, and `employees` is only 12k rows, so it was never the bottleneck. I made the change mostly for clarity, not because I think it's where the 8 seconds is going.
+
+### 2. Indexes
+
+```sql
+CREATE INDEX idx_checkouts_open_due_at
+ON checkouts (due_at)
+WHERE returned_at IS NULL;
+```
+
+This is a partial index — it only covers rows where `returned_at IS NULL`. I'd expect open checkouts to be a small, active slice of the 4.2M total, so a partial index here is a lot smaller and cheaper to maintain on every insert than a full index over the whole table, and it lines up exactly with this query's filter.
+
+The more interesting choice is leading with `due_at` rather than `checked_out_at`. A composite index like `(checked_out_at, due_at)` wouldn't actually get rid of the sort — `checked_out_at` is filtered with a range, not an equality, so rows within that range aren't globally ordered by `due_at`, only locally per `checked_out_at` value. Postgres would still need an explicit sort step. Leading with `due_at` instead means the index is already in the exact order the query asks for, so Postgres can scan it top to bottom, apply the `checked_out_at` range as a residual filter row by row, and emit already-sorted results with no separate sort at all.
+
+The thing I can't fully resolve without real data: if `checked_out_at` and `due_at` turn out not to be well correlated for open checkouts, this due_at-led scan could end up walking more index entries than a checked_out_at-led one would. Since `due_at` is always within 30 days of `checked_out_at` by the business rules, I'd expect decent correlation — but that's an assumption, not something I can claim confidently just from the schema.
+
+### 3. What EXPLAIN (ANALYZE, BUFFERS) would show
+
+Before: the top node is a `Seq Scan on checkouts`, with `Rows Removed by Filter` in the millions, a large `Buffers: shared read=...` covering most of the table's pages, and a `Sort` node above it — possibly `Sort Method: external merge Disk` if the filtered set is big enough to spill past `work_mem`, which is one of the more expensive things a plan can show. Runtime lines up with the roughly 8 seconds described.
+
+After: the top node becomes an `Index Scan using idx_checkouts_open_due_at`, `Rows Removed by Filter` shrinks to just the `checked_out_at` mismatches within the already-small open set, there's no `Sort` node above it, and `Buffers: shared hit/read` drops by roughly an order of magnitude.
+
+The one line I'd check first isn't the node name, it's whether the `Sort` node disappeared entirely and whether `Buffers: shared read` actually dropped — a plan can look different without reading meaningfully less data, and buffers is what tells you the fix reduced real I/O rather than just changing shape.
+
+### 4. What breaks first as the table keeps growing
+
+Two different problems on two different timelines. Nearer-term: every time a checkout is returned, `returned_at` flips from NULL to a timestamp, which is an UPDATE — and under MVCC that creates dead tuples. At 8,000 new rows a day plus a steady stream of returns, autovacuum has to keep up or the table bloats, and bloat slows down every scan including the new index. I'd watch `n_dead_tup` and `last_autovacuum` on this table specifically.
+
+Longer-term: once the table and its indexes stop fitting comfortably in memory, an Index Scan — which still needs a heap page fetch per matching row unless it qualifies as Index-Only — starts hitting real disk I/O instead of cache. I'd look at adding an `INCLUDE` clause so the index can serve this query as an Index-Only Scan, and keep an eye on the cache hit ratio in `pg_stat_database`. If maintenance operations start taking too long at some point down the line, partitioning `checkouts` by `checked_out_at` (monthly or quarterly) would let old, fully-returned partitions get pruned out of queries like this one entirely — but I wouldn't reach for that now, it's real added complexity I'd only take on once the simpler fixes stop being enough.
+
+### 5. What I'd want to measure before trusting this
+
+The number that actually decides whether this whole approach is right: what fraction of the 4.2M rows currently have `returned_at IS NULL`.
+
+```sql
+SELECT count(*) FILTER (WHERE returned_at IS NULL), count(*) FROM checkouts;
+```
+
+If open checkouts are a small percentage, the partial index is a clear win exactly as reasoned above. If a large share of checkouts stay open for a long time, the partial index barely helps over a full one, and I'd need to rethink the approach. There's no way to know that ratio from the schema alone — it's a fact about the real data, and the whole indexing strategy depends on it.
