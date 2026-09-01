@@ -41,6 +41,10 @@ class CheckOut(models.Model):
     due_at = models.DateTimeField()
     returned_at = models.DateTimeField(null=True, blank=True)
     condition_note = models.TextField(blank=True)
+    class Meta:
+        indexes = [
+            models.Index(fields=['returned_at', 'due_at'], name='checkout_overdue_idx'),
+        ]
 
     def __str__(self):
         return f"{self.asset.asset_tag} -> {self.employee.employee_code}"

@@ -36,7 +36,6 @@ class AssetListCreateView(generics.ListCreateAPIView):
 class AssetDetailView(generics.RetrieveAPIView):
     queryset = Asset.objects.all()
     serializer_class = AssetSerializer
-    # ← same as above, leave unchanged
 
 
 @api_view(['POST'])
@@ -44,11 +43,10 @@ def check_out_asset(request):
     serializer = CheckOutCreateSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
     data = serializer.validated_data
-
     employee = get_object_or_404(Employee, employee_code=data['employee_code'])
 
     if not employee.is_active:
-        return error_response("employee is not active", code="EMPLOYEE_INACTIVE", status=400)  
+        return error_response("employee is not active", code="EMPLOYEE_INACTIVE", status=400)
 
     now = timezone.now()
     if data['due_at'] <= now or data['due_at'] > now + timedelta(days=30):
@@ -57,17 +55,18 @@ def check_out_asset(request):
             code="INVALID_DUE_DATE", status=400,
         )
 
-    open_count = CheckOut.objects.filter(employee=employee, returned_at__isnull=True).count()
-    if open_count >= 3:
-        return error_response("employee already has 3 open checkouts", code="CHECKOUT_LIMIT_REACHED", status=409) 
-
     try:
         with transaction.atomic():
+            employee = Employee.objects.select_for_update().get(pk=employee.pk)
+
+            open_count = CheckOut.objects.filter(employee=employee, returned_at__isnull=True).count()
+            if open_count >= 3:
+                return error_response("employee already has 3 open checkouts", code="CHECKOUT_LIMIT_REACHED", status=409)
+
             asset = Asset.objects.select_for_update().get(asset_tag=data['asset_tag'])
 
-
             if asset.status != Asset.Status.AVAILABLE:
-                return error_response("asset is not available", code="ASSET_NOT_AVAILABLE", status=409)  
+                return error_response("asset is not available", code="ASSET_NOT_AVAILABLE", status=409)
 
             checkout = CheckOut.objects.create(
                 asset=asset,
@@ -77,9 +76,7 @@ def check_out_asset(request):
             asset.status = Asset.Status.CHECKED_OUT
             asset.save(update_fields=['status', 'updated_at'])
     except Asset.DoesNotExist:
-        return error_response("asset not found", code="ASSET_NOT_FOUND", status=404)  
-
-    return success_response(CheckOutSerializer(checkout).data, status=201) 
+        return error_response("asset not found", code="ASSET_NOT_FOUND", status=404)
 
 
 @api_view(['POST'])
@@ -134,7 +131,7 @@ def employee_summary(request, employee_code):
     if stats['mean_hold_duration'] is not None:
         mean_days = round(stats['mean_hold_duration'].total_seconds() / 86400, 2)
 
-    return Response({
+    return success_response({
         'employee_code': employee.employee_code,
         'full_name': employee.full_name,
         'lifetime_checkout_count': stats['lifetime_checkout_count'],
@@ -170,4 +167,4 @@ def overdue_report(request):
         for c in checkouts
     ]
 
-    return Response({'count': len(rows), 'results': rows})
+    return success_response({'count': len(rows), 'results': rows})
